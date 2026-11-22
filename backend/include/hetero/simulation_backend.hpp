@@ -21,6 +21,7 @@ class SimulationBackend final : public IExecutionBackend
     void set_policy(Policy) override;
     void set_worker_enabled(std::uint32_t, bool) override;
     nlohmann::json snapshot() const override;
+    std::string export_log() const override;
 
   private:
     enum class EventType
@@ -74,6 +75,9 @@ class SimulationBackend final : public IExecutionBackend
     double result_transfer_us() const;
     double compute_us(const Worker&) const;
     void initialize_workers(std::uint32_t count);
+    void initialize_matrices();
+    void compute_output_tile(const Task& task);
+    double calculate_relative_error() const;
     int choose_task(std::uint32_t worker) const;
     std::uint32_t choose_worker() const;
     double estimate_completion_time(std::uint32_t worker, std::uint32_t task) const;
@@ -85,8 +89,17 @@ class SimulationBackend final : public IExecutionBackend
     Policy policy_{Policy::Predicted};
     std::vector<Worker> workers_;
     std::vector<Task> tasks_;
+    std::vector<float> matrix_a_;
+    std::vector<float> matrix_b_;
+    std::vector<float> matrix_c_;
+    std::vector<float> reference_c_;
+    std::uint64_t computed_tiles_{0};
+    double relative_error_{0.0};
+    bool numerical_validation_done_{false};
     std::priority_queue<Event, std::vector<Event>, Later> events_;
     std::vector<EventView> history_;
+    std::vector<nlohmann::json> run_history_;
+    std::uint64_t run_sequence_{0};
     double sim_time_us_{0}, spi_free_at_{0};
     std::uint64_t sequence_{0};
     std::uint32_t rr_worker_cursor_{0};

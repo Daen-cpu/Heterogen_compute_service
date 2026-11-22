@@ -1,12 +1,17 @@
 #pragma once
-#include "simulation_backend.hpp"
+#include "execution_backend.hpp"
+#include <memory>
+#include <string>
+
 namespace hetero
 {
 class Controller
 {
 public:
     Controller();
+    explicit Controller(std::unique_ptr<IExecutionBackend> backend);
     nlohmann::json state() const;
+    std::string export_log() const;
     void configure(const nlohmann::json&);
     void start();
     void pause();
@@ -16,6 +21,6 @@ public:
     void set_worker(const nlohmann::json&);
 
 private:
-    SimulationBackend backend_;
+    std::unique_ptr<IExecutionBackend> backend_;
 };
 } // namespace hetero

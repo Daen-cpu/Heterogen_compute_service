@@ -4,7 +4,11 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <sstream>
+#include <utility>
+#include <iomanip>
 
 namespace hetero
 {
@@ -62,6 +66,7 @@ void SimulationBackend::configure(const Config& c)
 
     config_ = c;
     initialize_workers(c.worker_count);
+    initialize_matrices();
 
     tasks_.clear();
     events_ = {};
@@ -72,6 +77,9 @@ void SimulationBackend::configure(const Config& c)
     sequence_ = 0;
     rr_worker_cursor_ = 0;
     paused_ = false;
+    computed_tiles_ = 0;
+    relative_error_ = 0.0;
+    numerical_validation_done_ = false;
 }
 
 void SimulationBackend::start()
@@ -141,6 +149,10 @@ void SimulationBackend::reset()
     rr_worker_cursor_ = 0;
 
     initialize_workers(config_.worker_count);
+    initialize_matrices();
+    computed_tiles_ = 0;
+    relative_error_ = 0.0;
+    numerical_validation_done_ = false;
 }
 
 void SimulationBackend::set_policy(Policy p)
@@ -178,6 +190,77 @@ void SimulationBackend::set_worker_enabled(std::uint32_t id, bool enabled)
 void SimulationBackend::schedule(EventType t, double at, std::uint32_t w, std::uint32_t task)
 {
     events_.push(Event{at, sequence_++, t, w, task});
+}
+
+void SimulationBackend::initialize_matrices()
+{
+    const std::size_t n = config_.matrix_size;
+    const std::size_t elements = n * n;
+    matrix_a_.resize(elements);
+    matrix_b_.resize(elements);
+    matrix_c_.assign(elements, 0.0F);
+    reference_c_.assign(elements, 0.0F);
+
+    for (std::size_t row = 0; row < n; ++row)
+    {
+        for (std::size_t col = 0; col < n; ++col)
+        {
+            const std::size_t index = row * n + col;
+            const int a = static_cast<int>((row * 17U + col * 13U + 7U) % 23U) - 11;
+            const int b = static_cast<int>((row * 7U + col * 19U + 3U) % 29U) - 14;
+            matrix_a_[index] = static_cast<float>(a) / 16.0F;
+            matrix_b_[index] = static_cast<float>(b) / 16.0F;
+        }
+    }
+
+    for (std::size_t row = 0; row < n; ++row)
+    {
+        for (std::size_t col = 0; col < n; ++col)
+        {
+            double sum = 0.0;
+            for (std::size_t k = 0; k < n; ++k)
+                sum += static_cast<double>(matrix_a_[row * n + k]) *
+                       static_cast<double>(matrix_b_[k * n + col]);
+            reference_c_[row * n + col] = static_cast<float>(sum);
+        }
+    }
+}
+
+void SimulationBackend::compute_output_tile(const Task& task)
+{
+    const std::size_t n = config_.matrix_size;
+    const std::size_t block = config_.tile_size;
+    const std::size_t row_begin = static_cast<std::size_t>(task.row) * block;
+    const std::size_t col_begin = static_cast<std::size_t>(task.col) * block;
+
+    for (std::size_t row = row_begin; row < row_begin + block; ++row)
+    {
+        for (std::size_t col = col_begin; col < col_begin + block; ++col)
+        {
+            double sum = 0.0;
+            for (std::size_t k = 0; k < n; ++k)
+                sum += static_cast<double>(matrix_a_[row * n + k]) *
+                       static_cast<double>(matrix_b_[k * n + col]);
+            matrix_c_[row * n + col] = static_cast<float>(sum);
+        }
+    }
+    ++computed_tiles_;
+}
+
+double SimulationBackend::calculate_relative_error() const
+{
+    double diff_sq = 0.0;
+    double ref_sq = 0.0;
+    for (std::size_t i = 0; i < matrix_c_.size(); ++i)
+    {
+        const double diff = static_cast<double>(matrix_c_[i]) - static_cast<double>(reference_c_[i]);
+        const double ref = static_cast<double>(reference_c_[i]);
+        diff_sq += diff * diff;
+        ref_sq += ref * ref;
+    }
+    if (ref_sq == 0.0)
+        return diff_sq == 0.0 ? 0.0 : std::numeric_limits<double>::infinity();
+    return std::sqrt(diff_sq / ref_sq);
 }
 
 double SimulationBackend::input_transfer_us() const
@@ -532,6 +615,7 @@ void SimulationBackend::process_one()
         break;
 
     case EventType::ComputeDone:
+        compute_output_tile(t);
         w.busy_us += sim_time_us_ - w.state_since;
         w.state = WorkerState::WaitResult;
         t.state = "ready";
@@ -587,6 +671,53 @@ void SimulationBackend::process_one()
         w.state = w.enabled ? WorkerState::Idle : WorkerState::Failed;
 
         history_.push_back({sim_time_us_, "WORKER_IDLE", e.task, e.worker});
+
+        const bool all_completed = std::all_of(
+            tasks_.begin(), tasks_.end(),
+            [](const Task& task) { return task.state == "completed"; });
+
+        if (all_completed && !numerical_validation_done_)
+        {
+            relative_error_ = calculate_relative_error();
+            numerical_validation_done_ = true;
+            history_.push_back({
+                sim_time_us_,
+                relative_error_ <= 1e-6 ? "MATRIX_VALIDATION_PASSED" : "MATRIX_VALIDATION_FAILED",
+                e.task,
+                e.worker
+            });
+
+            double total_busy_us = 0.0;
+            nlohmann::json worker_results = nlohmann::json::array();
+            for (std::size_t worker_index = 0; worker_index < workers_.size(); ++worker_index)
+            {
+                const auto& worker = workers_[worker_index];
+                total_busy_us += worker.busy_us;
+                worker_results.push_back({
+                    {"worker_id", worker_index},
+                    {"completed_tiles", worker.completed},
+                    {"busy_us", worker.busy_us}
+                });
+            }
+            const double run_utilization = sim_time_us_ > 0.0
+                ? total_busy_us / (sim_time_us_ * static_cast<double>(workers_.size()))
+                : 0.0;
+            run_history_.push_back({
+                {"run_id", ++run_sequence_},
+                {"policy", to_string(policy_)},
+                {"matrix_size", config_.matrix_size},
+                {"tile_size", config_.tile_size},
+                {"worker_count", workers_.size()},
+                {"total_tasks", tasks_.size()},
+                {"sim_time_us", sim_time_us_},
+                {"worker_utilization", run_utilization},
+                {"relative_frobenius_error", relative_error_},
+                {"passed", relative_error_ <= 1e-6},
+                {"workers", std::move(worker_results)}
+            });
+            if (run_history_.size() > 3)
+                run_history_.erase(run_history_.begin());
+        }
 
         dispatch();
         break;
@@ -698,7 +829,8 @@ nlohmann::json SimulationBackend::snapshot() const
     const std::size_t done = std::count_if(tasks_.begin(), tasks_.end(),
                                            [](const auto& t) { return t.state == "completed"; });
 
-    return {{"job_state",
+    return {{"backend_mode", "simulation"},
+            {"job_state",
              to_string(!running_ && !tasks_.empty() && done == tasks_.size() ? JobState::Completed
                        : running_ ? (paused_ ? JobState::Paused : JobState::Running)
                                   : JobState::Idle)},
@@ -713,9 +845,60 @@ nlohmann::json SimulationBackend::snapshot() const
             {"progress",
              tasks_.empty() ? 0.0 : static_cast<double>(done) / static_cast<double>(tasks_.size())},
             {"worker_utilization", utilization},
+            {"numerical_validation",
+             {{"done", numerical_validation_done_},
+              {"computed_tiles", computed_tiles_},
+              {"total_tiles", tasks_.size()},
+              {"relative_frobenius_error", numerical_validation_done_ ? nlohmann::json(relative_error_) : nlohmann::json(nullptr)},
+              {"passed", numerical_validation_done_ && relative_error_ <= 1e-6}}},
             {"workers", ws},
             {"tasks", ts},
-            {"events", ev}};
+            {"events", ev},
+            {"run_history", run_history_}};
+}
+
+std::string SimulationBackend::export_log() const
+{
+    std::lock_guard lock(mutex_);
+    std::ostringstream output;
+    output << "ЖУРНАЛ СОБЫТИЙ ВЫЧИСЛИТЕЛЬНОГО ЭКСПЕРИМЕНТА\n";
+    output << "Размер матрицы: " << config_.matrix_size << " x " << config_.matrix_size << "\n";
+    output << "Размер блока: " << config_.tile_size << " x " << config_.tile_size << "\n";
+    output << "Количество исполнителей: " << config_.worker_count << "\n";
+    output << "Политика диспетчеризации: " << to_string(policy_) << "\n";
+    output << "Виртуальное время: " << std::fixed << std::setprecision(2) << sim_time_us_ << " мкс\n";
+    output << "Событий: " << history_.size() << "\n\n";
+    output << "Время, мкс\tСобытие\tЗадача\tИсполнитель\n";
+    const auto event_name = [](const std::string& type) -> const char*
+    {
+        if (type == "TASK_CREATED") return "ЗАДАЧА СОЗДАНА";
+        if (type == "SPI_INPUT_TRANSFER_STARTED") return "НАЧАЛО ПЕРЕДАЧИ ВХОДНЫХ ДАННЫХ";
+        if (type == "SPI_INPUT_TRANSFER_COMPLETED") return "ПЕРЕДАЧА ВХОДНЫХ ДАННЫХ ЗАВЕРШЕНА";
+        if (type == "COMPUTATION_STARTED") return "ВЫЧИСЛЕНИЕ НАЧАТО";
+        if (type == "COMPUTATION_COMPLETED") return "ВЫЧИСЛЕНИЕ ЗАВЕРШЕНО";
+        if (type == "READY_ASSERTED") return "СИГНАЛ READY АКТИВЕН";
+        if (type == "SPI_RESULT_TRANSFER_STARTED") return "НАЧАЛО ПЕРЕДАЧИ РЕЗУЛЬТАТА";
+        if (type == "RESULT_VALIDATED") return "ПОЛУЧЕНИЕ РЕЗУЛЬТАТА ЗАВЕРШЕНО";
+        if (type == "ACK_SENT") return "ПОДТВЕРЖДЕНИЕ ACK ОТПРАВЛЕНО";
+        if (type == "READY_DEASSERTED") return "СИГНАЛ READY СБРОШЕН";
+        if (type == "WORKER_IDLE") return "ИСПОЛНИТЕЛЬ СВОБОДЕН";
+        if (type == "MATRIX_VALIDATION_PASSED") return "ПРОВЕРКА МАТРИЦЫ ПРОЙДЕНА";
+        if (type == "MATRIX_VALIDATION_FAILED") return "ОШИБКА ПРОВЕРКИ МАТРИЦЫ";
+        return type.c_str();
+    };
+    for (const auto& event : history_)
+    {
+        output << std::fixed << std::setprecision(2) << event.time_us << '\t'
+               << event_name(event.type) << '\t' << event.task_id << '\t'
+               << (event.worker_id + 1) << '\n';
+    }
+    if (numerical_validation_done_)
+    {
+        output << "\nОтносительная ошибка Фробениуса: " << std::scientific
+               << relative_error_ << '\n';
+        output << "Проверка: " << (relative_error_ <= 1e-6 ? "ПРОЙДЕНА" : "НЕ ПРОЙДЕНА") << '\n';
+    }
+    return output.str();
 }
 
 } // namespace hetero

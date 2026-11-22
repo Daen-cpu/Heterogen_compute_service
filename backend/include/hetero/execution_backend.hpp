@@ -1,6 +1,7 @@
 #pragma once
 #include "types.hpp"
 #include <memory>
+#include <string>
 #include <nlohmann/json.hpp>
 
 namespace hetero
@@ -19,5 +20,6 @@ public:
     virtual void set_policy(Policy) = 0;
     virtual void set_worker_enabled(std::uint32_t id, bool enabled) = 0;
     virtual nlohmann::json snapshot() const = 0;
+    virtual std::string export_log() const = 0;
 };
 } // namespace hetero

@@ -3,6 +3,7 @@
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
 #include <iostream>
+#include <thread>
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace net = boost::asio;
@@ -31,6 +32,12 @@ static http::response<http::string_body> handle(Controller& c,
         const std::string path(req.target());
         if (req.method() == http::verb::get && path == "/api/state")
             res.body() = c.state().dump();
+        else if (req.method() == http::verb::get && path == "/api/log.txt")
+        {
+            res.set(http::field::content_type, "text/plain; charset=utf-8");
+            res.set(http::field::content_disposition, "attachment; filename=experiment_log.txt");
+            res.body() = c.export_log();
+        }
         else if (req.method() == http::verb::post && path == "/api/configure")
         {
             c.configure(body);
