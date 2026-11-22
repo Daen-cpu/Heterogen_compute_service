@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace hetero
@@ -29,6 +30,21 @@ SimulationBackend::~SimulationBackend()
     }
 }
 
+void SimulationBackend::initialize_workers(std::uint32_t count)
+{
+    static constexpr double factors[] = {0.92, 1.0, 1.07};
+
+    workers_.assign(count, Worker{});
+
+    for (std::size_t i = 0; i < workers_.size(); ++i)
+    {
+        workers_[i].speed = factors[i];
+        workers_[i].state = WorkerState::Idle;
+        workers_[i].enabled = true;
+        workers_[i].ready_asserted = false;
+    }
+}
+
 void SimulationBackend::configure(const Config& c)
 {
     std::lock_guard lock(mutex_);
@@ -45,14 +61,7 @@ void SimulationBackend::configure(const Config& c)
     }
 
     config_ = c;
-    workers_.assign(c.worker_count, Worker{});
-
-    const double factors[3] = {0.92, 1.0, 1.07};
-
-    for (std::size_t i = 0; i < workers_.size(); ++i)
-    {
-        workers_[i].speed = factors[i];
-    }
+    initialize_workers(c.worker_count);
 
     tasks_.clear();
     events_ = {};
@@ -61,7 +70,7 @@ void SimulationBackend::configure(const Config& c)
     sim_time_us_ = 0;
     spi_free_at_ = 0;
     sequence_ = 0;
-    rr_cursor_ = 0;
+    rr_worker_cursor_ = 0;
     paused_ = false;
 }
 
@@ -129,16 +138,9 @@ void SimulationBackend::reset()
     sim_time_us_ = 0;
     spi_free_at_ = 0;
     sequence_ = 0;
-    rr_cursor_ = 0;
+    rr_worker_cursor_ = 0;
 
-    workers_.assign(config_.worker_count, Worker{});
-
-    const double factors[3] = {0.92, 1.0, 1.07};
-
-    for (std::size_t i = 0; i < workers_.size(); ++i)
-    {
-        workers_[i].speed = factors[i];
-    }
+    initialize_workers(config_.worker_count);
 }
 
 void SimulationBackend::set_policy(Policy p)
@@ -163,9 +165,9 @@ void SimulationBackend::set_worker_enabled(std::uint32_t id, bool enabled)
     if (!enabled && w.state == WorkerState::Idle)
     {
         w.enabled = false;
-        w.state = WorkerState::Disabled;
+        w.state = WorkerState::Failed;
     }
-    else if (enabled && w.state == WorkerState::Disabled)
+    else if (enabled && w.state == WorkerState::Failed)
     {
         w.enabled = true;
         w.state = WorkerState::Idle;
@@ -203,46 +205,235 @@ double SimulationBackend::compute_us(const Worker& w) const
     return ops / (base_mops * 1e6) * 1e6 + 80.0;
 }
 
-int SimulationBackend::choose_task(std::uint32_t worker)
+int SimulationBackend::choose_task(std::uint32_t worker) const
 {
-    std::vector<int> q;
+    (void)worker;
 
     for (std::size_t i = 0; i < tasks_.size(); ++i)
     {
         if (tasks_[i].state == "queued")
         {
-            q.push_back(static_cast<int>(i));
+            return static_cast<int>(i);
         }
     }
 
-    if (q.empty())
+    return -1;
+}
+
+double SimulationBackend::estimate_completion_time(
+    std::uint32_t worker_id,
+    std::uint32_t task_index) const
+{
+    if (worker_id >= workers_.size() || task_index >= tasks_.size())
     {
-        return -1;
+        return std::numeric_limits<double>::infinity();
+    }
+
+    const auto& candidate_worker = workers_[worker_id];
+
+    // A new input transfer is appended after all SPI transfers already reserved.
+    const double candidate_input_begin = std::max(sim_time_us_, spi_free_at_);
+    const double candidate_input_done =
+        candidate_input_begin + input_transfer_us();
+
+    const double candidate_compute_done =
+        candidate_input_done + compute_us(candidate_worker);
+
+    struct PendingOutput
+    {
+        double ready_at{};
+        std::uint32_t worker_id{};
+        std::uint32_t task_id{};
+        bool candidate{};
+    };
+
+    std::vector<PendingOutput> pending_outputs;
+    pending_outputs.reserve(workers_.size() + 1);
+
+    // Predict the output-ready time of each currently active worker.
+    // Transfers already in ResultTransfer state have already reserved their
+    // SPI interval and are therefore included in spi_free_at_.
+    for (std::uint32_t i = 0; i < workers_.size(); ++i)
+    {
+        const auto& worker = workers_[i];
+
+        if (worker.task < 0 || i == worker_id)
+        {
+            continue;
+        }
+
+        const auto task_index_active = static_cast<std::size_t>(worker.task);
+        if (task_index_active >= tasks_.size())
+        {
+            continue;
+        }
+
+        const auto task_id_active = tasks_[task_index_active].id;
+
+        if (worker.state == WorkerState::Idle ||
+            worker.state == WorkerState::Failed ||
+            (worker.state == WorkerState::Transfer && !worker.input_transfer_active))
+        {
+            continue;
+        }
+
+        std::optional<double> event_time;
+        auto queued_events = events_;
+
+        while (!queued_events.empty())
+        {
+            const auto event = queued_events.top();
+            queued_events.pop();
+
+            if (event.worker != i || event.task != task_id_active)
+            {
+                continue;
+            }
+
+            if ((worker.state == WorkerState::Transfer &&
+                 worker.input_transfer_active &&
+                 event.type == EventType::InputDone) ||
+                (worker.state == WorkerState::Busy &&
+                 event.type == EventType::ComputeDone) ||
+                (worker.state == WorkerState::WaitResult &&
+                 event.type == EventType::ReadyAsserted))
+            {
+                event_time = event.at;
+                break;
+            }
+        }
+
+        if (!event_time)
+        {
+            continue;
+        }
+
+        double output_ready_at = *event_time;
+
+        if (worker.state == WorkerState::Transfer && worker.input_transfer_active)
+        {
+            output_ready_at += compute_us(worker);
+        }
+
+        pending_outputs.push_back({
+            output_ready_at,
+            i,
+            task_id_active,
+            false
+        });
+    }
+
+    // Include the candidate task in the predicted output queue.
+    pending_outputs.push_back({
+        candidate_compute_done,
+        worker_id,
+        tasks_[task_index].id,
+        true
+    });
+
+    std::stable_sort(
+        pending_outputs.begin(),
+        pending_outputs.end(),
+        [](const PendingOutput& lhs, const PendingOutput& rhs)
+        {
+            if (lhs.ready_at != rhs.ready_at)
+            {
+                return lhs.ready_at < rhs.ready_at;
+            }
+
+            if (lhs.worker_id != rhs.worker_id)
+            {
+                return lhs.worker_id < rhs.worker_id;
+            }
+
+            return lhs.task_id < rhs.task_id;
+        });
+
+    // All already-reserved SPI intervals, including the candidate input,
+    // precede these not-yet-reserved result transfers.
+    double projected_spi_free_at = candidate_input_done;
+
+    for (const auto& output : pending_outputs)
+    {
+        const double transfer_begin =
+            std::max(output.ready_at, projected_spi_free_at);
+
+        projected_spi_free_at =
+            transfer_begin + result_transfer_us();
+
+        if (output.candidate)
+        {
+            return projected_spi_free_at - sim_time_us_;
+        }
+    }
+
+    return std::numeric_limits<double>::infinity();
+}
+
+std::uint32_t SimulationBackend::choose_worker() const
+{
+    std::vector<std::uint32_t> idle_workers;
+
+    for (std::uint32_t i = 0; i < workers_.size(); ++i)
+    {
+        if (workers_[i].enabled && workers_[i].state == WorkerState::Idle)
+        {
+            idle_workers.push_back(i);
+        }
+    }
+
+    if (idle_workers.empty())
+    {
+        return static_cast<std::uint32_t>(workers_.size());
     }
 
     if (policy_ == Policy::RoundRobin)
     {
-        auto it = std::find_if(q.begin(), q.end(),
-                               [&](int x) { return static_cast<std::uint32_t>(x) >= rr_cursor_; });
+        for (std::size_t offset = 0; offset < workers_.size(); ++offset)
+        {
+            const auto candidate =
+                (rr_worker_cursor_ + static_cast<std::uint32_t>(offset)) %
+                static_cast<std::uint32_t>(workers_.size());
 
-        const int chosen = it == q.end() ? q.front() : *it;
-
-        rr_cursor_ = static_cast<std::uint32_t>(chosen + 1);
-
-        return chosen;
+            if (workers_[candidate].enabled &&
+                workers_[candidate].state == WorkerState::Idle)
+            {
+                return candidate;
+            }
+        }
     }
 
-    if (policy_ == Policy::LeastLoaded)
+    const int first_task = choose_task(0);
+    if (first_task < 0)
     {
-        return *std::min_element(q.begin(), q.end(),
-                                 [&](int a, int b) { return tasks_[a].id < tasks_[b].id; });
+        return static_cast<std::uint32_t>(workers_.size());
     }
 
-    // Predicted: assign the next task to the fastest currently idle executor.
-    // Queue order remains deterministic.
-    (void)worker;
+    auto best_worker = idle_workers.front();
+    double best_score = std::numeric_limits<double>::infinity();
 
-    return q.front();
+    for (const auto candidate : idle_workers)
+    {
+        const double predicted_finish =
+            estimate_completion_time(candidate, static_cast<std::uint32_t>(first_task));
+
+        // LeastLoaded balances accumulated service demand, while including
+        // the candidate's predicted compute and shared-SPI completion time.
+        // Predicted minimizes only the projected completion time of this assignment.
+        const double score =
+            policy_ == Policy::LeastLoaded
+                ? workers_[candidate].busy_us + predicted_finish
+                : predicted_finish;
+
+        if (score < best_score ||
+            (score == best_score && candidate < best_worker))
+        {
+            best_score = score;
+            best_worker = candidate;
+        }
+    }
+
+    return best_worker;
 }
 
 void SimulationBackend::dispatch()
@@ -252,63 +443,51 @@ void SimulationBackend::dispatch()
         return;
     }
 
-    std::vector<std::uint32_t> order;
-
-    for (std::uint32_t i = 0; i < workers_.size(); ++i)
+    while (true)
     {
-        order.push_back(i);
-    }
-
-    if (policy_ == Policy::Predicted)
-    {
-        std::stable_sort(order.begin(), order.end(),
-                         [&](auto a, auto b) { return workers_[a].speed > workers_[b].speed; });
-    }
-    else if (policy_ == Policy::LeastLoaded)
-    {
-        std::stable_sort(order.begin(), order.end(),
-                         [&](auto a, auto b)
-                         { return workers_[a].completed < workers_[b].completed; });
-    }
-    else if (!order.empty())
-    {
-        std::rotate(order.begin(), order.begin() + (rr_cursor_ % order.size()), order.end());
-    }
-
-    for (std::uint32_t wi : order)
-    {
-        auto& w = workers_[wi];
-
-        if (!w.enabled || w.state != WorkerState::Idle)
+        const int task_index = choose_task(0);
+        if (task_index < 0)
         {
-            continue;
+            return;
         }
 
-        const int ti = choose_task(wi);
-
-        if (ti < 0)
+        const auto worker_id = choose_worker();
+        if (worker_id >= workers_.size())
         {
-            break;
+            return;
         }
 
-        auto& t = tasks_[static_cast<std::size_t>(ti)];
+        auto& worker = workers_[worker_id];
+        auto& task = tasks_[static_cast<std::size_t>(task_index)];
 
-        t.state = "dispatched";
-        t.worker = static_cast<int>(wi);
+        task.state = "dispatched";
+        task.worker = static_cast<int>(worker_id);
 
-        history_.push_back({sim_time_us_, "TASK_DISPATCHED", t.id, wi});
+        history_.push_back({
+            sim_time_us_,
+            "TASK_DISPATCHED",
+            task.id,
+            worker_id
+        });
 
-        w.task = ti;
-        w.state = WorkerState::InputTransfer;
-        w.state_since = sim_time_us_;
+        worker.task = task_index;
+        worker.state = WorkerState::Transfer;
+        worker.state_since = sim_time_us_;
+        worker.input_transfer_active = true;
 
-        const double begin = std::max(sim_time_us_, spi_free_at_);
-        const double duration = input_transfer_us();
+        const double input_begin = std::max(sim_time_us_, spi_free_at_);
+        const double input_done = input_begin + input_transfer_us();
 
-        spi_free_at_ = begin + duration;
+        spi_free_at_ = input_done;
 
-        schedule(EventType::InputStart, begin, wi, t.id);
-        schedule(EventType::InputDone, spi_free_at_, wi, t.id);
+        schedule(EventType::InputStart, input_begin, worker_id, task.id);
+        schedule(EventType::InputDone, input_done, worker_id, task.id);
+
+        if (policy_ == Policy::RoundRobin)
+        {
+            rr_worker_cursor_ =
+                (worker_id + 1) % static_cast<std::uint32_t>(workers_.size());
+        }
     }
 }
 
@@ -340,7 +519,8 @@ void SimulationBackend::process_one()
         break;
 
     case EventType::InputDone:
-        w.state = WorkerState::Computing;
+        w.input_transfer_active = false;
+        w.state = WorkerState::Busy;
         w.state_since = sim_time_us_;
         t.state = "computing";
 
@@ -353,7 +533,7 @@ void SimulationBackend::process_one()
 
     case EventType::ComputeDone:
         w.busy_us += sim_time_us_ - w.state_since;
-        w.state = WorkerState::Ready;
+        w.state = WorkerState::WaitResult;
         t.state = "ready";
 
         history_.push_back({sim_time_us_, "COMPUTATION_COMPLETED", e.task, e.worker});
@@ -365,20 +545,23 @@ void SimulationBackend::process_one()
     {
         history_.push_back({sim_time_us_, "READY_ASSERTED", e.task, e.worker});
 
-        const double begin = std::max(sim_time_us_, spi_free_at_);
+        w.ready_asserted = true;
 
+        const double begin = std::max(sim_time_us_, spi_free_at_);
         spi_free_at_ = begin + result_transfer_us();
 
-        w.state = WorkerState::ResultTransfer;
+        w.state = WorkerState::WaitResult;
 
         schedule(EventType::ResultStart, begin, e.worker, e.task);
-
         schedule(EventType::ResultDone, spi_free_at_, e.worker, e.task);
 
         break;
     }
 
     case EventType::ResultStart:
+        w.input_transfer_active = false;
+        w.state = WorkerState::Transfer;
+        w.state_since = sim_time_us_;
         history_.push_back({sim_time_us_, "SPI_RESULT_TRANSFER_STARTED", e.task, e.worker});
         break;
 
@@ -391,6 +574,8 @@ void SimulationBackend::process_one()
     case EventType::AckSent:
         history_.push_back({sim_time_us_, "ACK_SENT", e.task, e.worker});
 
+        w.ready_asserted = false;
+        history_.push_back({sim_time_us_, "READY_DEASSERTED", e.task, e.worker});
         schedule(EventType::WorkerIdle, sim_time_us_, e.worker, e.task);
         break;
 
@@ -398,7 +583,8 @@ void SimulationBackend::process_one()
         t.state = "completed";
         w.completed++;
         w.task = -1;
-        w.state = w.enabled ? WorkerState::Idle : WorkerState::Disabled;
+        w.input_transfer_active = false;
+        w.state = w.enabled ? WorkerState::Idle : WorkerState::Failed;
 
         history_.push_back({sim_time_us_, "WORKER_IDLE", e.task, e.worker});
 
@@ -476,6 +662,12 @@ nlohmann::json SimulationBackend::snapshot() const
                       {"speed_factor", w.speed},
                       {"completed_tiles", w.completed},
                       {"busy_us", w.busy_us},
+                      {"ready_asserted", w.ready_asserted},
+                      {"ready_line", w.ready_asserted ? "LOW" : "HIGH"},
+                      {"transfer_phase",
+                       w.state == WorkerState::Transfer
+                           ? (w.input_transfer_active ? "INPUT" : "RESULT")
+                           : "NONE"},
                       {"task_id",
                        w.task < 0 ? nlohmann::json(nullptr)
                                   : nlohmann::json(tasks_[static_cast<std::size_t>(w.task)].id)}});

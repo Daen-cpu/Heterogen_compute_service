@@ -48,6 +48,8 @@ class SimulationBackend final : public IExecutionBackend
         std::uint64_t completed{};
         double busy_us{}, wait_us{};
         double state_since{};
+        bool ready_asserted{};
+        bool input_transfer_active{};
         int task{-1};
     };
     struct Event
@@ -71,13 +73,10 @@ class SimulationBackend final : public IExecutionBackend
     double input_transfer_us() const;
     double result_transfer_us() const;
     double compute_us(const Worker&) const;
-    int choose_task(std::uint32_t worker);
+    void initialize_workers(std::uint32_t count);
+    int choose_task(std::uint32_t worker) const;
     std::uint32_t choose_worker() const;
-
-    double estimate_completion_time(
-        std::uint32_t worker,
-        std::uint32_t task
-    ) const;
+    double estimate_completion_time(std::uint32_t worker, std::uint32_t task) const;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::thread thread_;

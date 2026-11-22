@@ -14,13 +14,12 @@ enum class Policy
 };
 enum class WorkerState
 {
-    Disabled,
     Idle,
-    InputTransfer,
-    Computing,
-    Ready,
-    ResultTransfer,
-    Error
+    Busy,
+    WaitResult,
+    Transfer,
+    Failed,
+    Recovery
 };
 enum class JobState
 {
@@ -47,22 +46,20 @@ inline std::string to_string(WorkerState s)
 {
     switch (s)
     {
-    case WorkerState::Disabled:
-        return "disabled";
     case WorkerState::Idle:
-        return "idle";
-    case WorkerState::InputTransfer:
-        return "input_transfer";
-    case WorkerState::Computing:
-        return "computing";
-    case WorkerState::Ready:
-        return "ready";
-    case WorkerState::ResultTransfer:
-        return "result_transfer";
-    case WorkerState::Error:
-        return "error";
+        return "IDLE";
+    case WorkerState::Busy:
+        return "BUSY";
+    case WorkerState::WaitResult:
+        return "WAIT_RESULT";
+    case WorkerState::Transfer:
+        return "TRANSFER";
+    case WorkerState::Failed:
+        return "FAILED";
+    case WorkerState::Recovery:
+        return "RECOVERY";
     }
-    return "unknown";
+    return "UNKNOWN";
 }
 inline std::string to_string(JobState s)
 {
@@ -97,6 +94,7 @@ struct WorkerView
     std::uint64_t completed_tiles{};
     double busy_us{};
     double wait_us{};
+    bool ready_asserted{};
     std::optional<std::uint32_t> task_id;
 };
 struct TaskView

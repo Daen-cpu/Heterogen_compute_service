@@ -9,7 +9,7 @@ namespace hetero
 // physical.
 class IExecutionBackend
 {
-  public:
+public:
     virtual ~IExecutionBackend() = default;
     virtual void configure(const Config&) = 0;
     virtual void start() = 0;

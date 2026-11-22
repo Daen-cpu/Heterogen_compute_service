@@ -103,9 +103,7 @@ export default function App() {
         <main className="shell">
             <header>
                 <div>
-                    <div className="eyebrow">HETEROGENEOUS COMPUTING PLATFORM</div>
-                    <h1>HeteroCompute</h1>
-                    <p>Централизованное управление распределённым вычислением</p>
+                    <h1>Централизованное управление распределённым вычислением</h1>
                 </div>
                 <div className="backend">
                     <span className="dot" /> SIMULATION BACKEND <small></small>
@@ -120,15 +118,15 @@ export default function App() {
                 <a>Analytics</a>
             </nav>
             <section className="metrics">
-                <Metric label="JOB STATE" value={s.job_state.toUpperCase()} />
+                <Metric label="СОСТОЯНИЕ ПРОЦЕССА" value={s.job_state.toUpperCase()} />
                 <Metric
-                    label="PROGRESS"
+                    label="ПРОГРЕСС"
                     value={`${pct}%`}
-                    detail={`${s.completed_tasks} / ${s.total_tasks} tiles`}
+                    detail={`${s.completed_tasks} / ${s.total_tasks} блоков`}
                 />
-                <Metric label="SIMULATION TIME" value={fmt(s.sim_time_us)} />
+                <Metric label="ВРЕМЯ СИМУЛЯЦИИ" value={fmt(s.sim_time_us)} />
                 <Metric
-                    label="WORKER UTILIZATION"
+                    label="ЗАГРУЗКА ИСПОЛНИТЕЛЕЙ"
                     value={`${(s.worker_utilization * 100).toFixed(1)}%`}
                 />
             </section>
@@ -136,28 +134,27 @@ export default function App() {
                 <article className="panel">
                     <div className="panel-head">
                         <div>
-                            <h2>Executor nodes</h2>
-                            <p>Активные исполнительные узлы</p>
+                            <h2>Активные исполнительные узлы</h2>
                         </div>
                     </div>
                     <div className="nodes">
                         {s.workers.map((w) => (
                             <div className="node" key={w.id}>
                                 <div className="node-top">
-                                    <b>WORKER N{w.id + 1}</b>
+                                    <b>УЗЕЛ N{w.id + 1}</b>
                                     <span className={`state ${w.state}`}>
                                         {w.state.replace('_', ' ')}
                                     </span>
                                 </div>
                                 <div className="speed">
-                                    Performance factor <b>{w.speed_factor.toFixed(2)}×</b>
+                                    Коэффициент производительности <b>{w.speed_factor.toFixed(2)}×</b>
                                 </div>
                                 <div className="node-stats">
-                                    <span>Completed tiles</span>
+                                    <span>Выполнено блоков</span>
                                     <b>{w.completed_tiles}</b>
                                 </div>
                                 <div className="node-stats">
-                                    <span>Compute busy</span>
+                                    <span>Загрузка</span>
                                     <b>{fmt(w.busy_us)}</b>
                                 </div>
                                 <button
@@ -178,12 +175,11 @@ export default function App() {
                 <article className="panel config">
                     <div className="panel-head">
                         <div>
-                            <h2>Workload & scheduler</h2>
-                            <p>Параметры вычислительного эксперимента</p>
+                            <h2>Параметры вычислительного эксперимента</h2>
                         </div>
                     </div>
                     <label>
-                        Matrix dimension
+                        Размер матрицы
                         <select value={matrix} onChange={(e) => setMatrix(Number(e.target.value))}>
                             <option value={64}>64 × 64</option>
                             <option value={128}>128 × 128</option>
@@ -191,7 +187,7 @@ export default function App() {
                         </select>
                     </label>
                     <label>
-                        Tile dimension
+                        Размер блока
                         <select value={tile} onChange={(e) => setTile(Number(e.target.value))}>
                             <option value={16}>16 × 16</option>
                             <option value={32}>32 × 32</option>
@@ -199,7 +195,7 @@ export default function App() {
                         </select>
                     </label>
                     <label>
-                        Available workers
+                        Активные исполнители
                         <select
                             value={workers}
                             onChange={(e) => setWorkers(Number(e.target.value))}
@@ -210,7 +206,7 @@ export default function App() {
                         </select>
                     </label>
                     <label>
-                        Scheduling policy
+                        Политика диспетчеризации
                         <select value={policy} onChange={(e) => changePolicy(e.target.value)}>
                             <option value="predicted">Predicted</option>
                             <option value="least_loaded">Least loaded</option>
@@ -218,29 +214,28 @@ export default function App() {
                         </select>
                     </label>
                     <div className="buttons">
-                        <button onClick={configure}>Apply configuration</button>
+                        <button onClick={configure}>Применить конфигурацию</button>
                         <button className="secondary" onClick={() => action('/api/reset')}>
-                            Reset
+                            Сброс
                         </button>
                     </div>
                     <div className="buttons">
-                        <button onClick={() => action('/api/start')}>Start</button>
+                        <button onClick={() => action('/api/start')}>Запуск</button>
                         <button className="secondary" onClick={() => action('/api/pause')}>
-                            Pause
+                            Пауза
                         </button>
-                        <button className="secondary" onClick={() => action('/api/resume')}>
-                            Resume
-                        </button>
+                        {/*<button className="secondary" onClick={() => action('/api/resume')}>*/}
+                        {/*    Резюмировать*/}
+                        {/*</button>*/}
                     </div>
                 </article>
             </section>
             <section className="panel timeline">
                 <div className="panel-head">
                     <div>
-                        <h2>Execution trace</h2>
-                        <p>Журнал событий дискретно-событийной модели</p>
+                        <h2>Журнал событий дискретно-событийной модели</h2>
                     </div>
-                    <span className="muted">Virtual time · µs</span>
+                    <span className="muted">Виртуальное время · µs</span>
                 </div>
                 <div className="table-wrap">
                     <table>
@@ -273,8 +268,7 @@ export default function App() {
                 </div>
             </section>
             <footer>
-                HeteroCompute · v0.2 · Discrete-event simulation · Results are model estimates, not
-                hardware measurements.
+                 · v0.2 ·
             </footer>
         </main>
     );

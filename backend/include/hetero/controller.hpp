@@ -4,7 +4,7 @@ namespace hetero
 {
 class Controller
 {
-  public:
+public:
     Controller();
     nlohmann::json state() const;
     void configure(const nlohmann::json&);
@@ -15,7 +15,7 @@ class Controller
     void set_policy(const nlohmann::json&);
     void set_worker(const nlohmann::json&);
 
-  private:
+private:
     SimulationBackend backend_;
 };
 } // namespace hetero
