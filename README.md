@@ -1,39 +1,50 @@
-# HeteroCompute v0.2
+# HeteroCompute v0.4
 
-HeteroCompute is a web control plane for experiments with a heterogeneous master/worker computing platform.
+HeteroCompute is a web application for configuring and monitoring experiments with a heterogeneous master/worker computing system.
 
-- Master/control plane: C++20 REST server.
-- UI: React + TypeScript + Vite.
-- Execution boundary: `IExecutionBackend`.
-- Current backend: discrete-event simulation of one serialized SPI resource and up to three independent workers.
-- Intended hardware target: Linux master (NXP i.MX91) + STM32F407 workers. Physical SPI/GPIO integration is **not implemented** in this version.
+- **Backend:** C++20, Boost.Asio, Boost.Beast, nlohmann/json.
+- **Frontend:** React, TypeScript, Vite.
+- **Architecture:** REST API, Controller, `IExecutionBackend` interface.
+- **Current execution backend:** `SimulationBackend`.
+- **Simulation model:** one shared SPI resource and up to three independent workers.
+- **Intended hardware platform:** NXP i.MX91 Linux master and STM32F407 workers. Physical SPI and GPIO integration is not implemented.
 
 ## Architecture
 
 ```text
 React UI
-   | REST
-C++ HTTP API -> Controller -> IExecutionBackend
-                                  |
-                           SimulationBackend
-                                  |
-                    Event queue + SPI resource
-                     /          |          \
-                 Worker 1    Worker 2    Worker 3
+   |
+   | REST API
+   |
+HTTP Server
+   |
+Controller
+   |
+IExecutionBackend
+   |
+SimulationBackend
+   |
+Event Queue + Shared SPI Resource
+   |
+Worker 1 | Worker 2 | Worker 3
 ```
 
-The `IExecutionBackend` interface is the seam for a future `HardwareBackend`. The UI and REST API should not depend on SPI/GPIO details.
+The `IExecutionBackend` interface separates the control layer from the execution backend and provides an extension point for a future hardware implementation.
 
-## Build and run (Ubuntu 22.04 / WSL2)
+## Build and Run
 
-Install dependencies:
+### Dependencies
+
+Ubuntu 22.04 / WSL2:
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake libboost-system-dev nlohmann-json3-dev
 ```
 
-Build and run backend:
+Frontend requirements: Node.js and npm.
+
+### Backend
 
 ```bash
 cmake -S backend -B build -DCMAKE_BUILD_TYPE=Release
@@ -41,7 +52,11 @@ cmake --build build -j
 ./build/hetero_backend
 ```
 
-In another terminal:
+The REST API listens on port `8080`.
+
+### Frontend
+
+In a separate terminal:
 
 ```bash
 cd frontend
@@ -49,41 +64,107 @@ npm install
 npm run dev
 ```
 
-Open <http://localhost:5173>. REST API listens on `http://127.0.0.1:8080`.
+Open `http://localhost:5173`.
 
-## API
+## REST API
 
-- `GET /api/state`
-- `POST /api/configure` — `{ "matrix_size":128, "tile_size":32, "worker_count":3, "spi_mbps":10, "wall_delay_ms":4 }`
-- `POST /api/start`
-- `POST /api/pause`
-- `POST /api/resume`
-- `POST /api/reset`
-- `POST /api/policy` — `{ "policy":"predicted|least_loaded|round_robin" }`
-- `POST /api/worker` — `{ "id":0, "enabled":false }`
+| Method | Endpoint | Description |
+|---|---|---|
+| GET | `/api/state` | Returns the current system state |
+| GET | `/api/log.txt` | Exports the experiment event log |
+| POST | `/api/configure` | Configures matrix dimensions and worker count |
+| POST | `/api/start` | Starts an experiment |
+| POST | `/api/pause` | Pauses execution |
+| POST | `/api/resume` | Resumes execution |
+| POST | `/api/reset` | Resets the current experiment |
+| POST | `/api/policy` | Changes the worker assignment policy |
+| POST | `/api/worker` | Enables or disables a worker |
 
-## Model semantics
+Example configuration:
 
-Each task is one output tile `C_ij`. Its input payload is approximated as two dense panels of size `N × b` float32; the output tile is `b × b` float32. SPI transfers are serialized globally. Worker computation is modeled independently, allowing compute overlap between workers and with later SPI transfers. A worker becomes idle only after result transfer and ACK event.
+```json
+{
+  "matrix_size": 128,
+  "tile_size": 32,
+  "worker_count": 3,
+  "spi_mbps": 10,
+  "wall_delay_ms": 4
+}
+```
 
-The event trace includes input-transfer start/completion, computation completion, READY, result transfer, validation, ACK, and worker-idle events.
+Available assignment policies:
 
-## Known limitations — read before interpreting results
+- `round_robin`
+- `least_loaded`
+- `predicted`
 
-1. This is an architectural prototype and a simulator scaffold, not a validated replica of any earlier MATLAB/CSV model.
-2. The compute rate and transfer overhead are configurable assumptions, not measured STM32F407/i.MX91 performance.
-3. The current scheduling policies are preliminary. `predicted` currently preserves queue order; it does not yet estimate completion time using a calibrated performance model. `least_loaded` is a placeholder policy and needs a proper load metric.
-4. Input/result packet framing, CRC, retransmission, sequence numbers, task-attempt IDs, timeout recovery and stale-result rejection are not implemented yet.
-5. Worker disable is currently accepted only when a worker is idle. Safe draining/reassignment of in-flight work is a future requirement.
-6. No persistent experiment database, WebSocket stream, authentication, or hardware backend is included.
-7. The simulator models a single shared SPI bus. GPIO READY/ACK are represented as logical events, not electrical timing.
-8. The simple HTTP server is intended for local development only; do not expose it to an untrusted network.
+## Simulation Model
 
-## Next engineering increments
+The matrix multiplication task is divided into output tiles \(C_{ij}\). Each task is assigned to one worker.
 
-1. Extract a deterministic event engine and unit-test event ordering, task conservation and SPI mutual exclusion.
-2. Implement calibrated scheduling policies and runtime policy switching semantics.
-3. Add packet protocol and fault injection (CRC error, timeout, dropped ACK, worker loss).
-4. Add experiment persistence (SQLite), reproducible run configuration and CSV export.
-5. Add WebSocket telemetry.
-6. Implement `HardwareBackend` on the i.MX91 Linux host and validate READY/ACK + SPI timing against the real board.
+The simulator models the following stages:
+
+1. Assignment of a task to an available worker.
+2. Transfer of input matrix data through the shared SPI resource.
+3. Independent computation on the worker.
+4. Generation of the logical READY event.
+5. Transfer of the resulting tile through SPI.
+6. ACK event and transition of the worker to the idle state.
+
+SPI transfers are serialized: only one transfer can use the shared resource at a time. Computation on different workers can overlap with each other and with SPI transfers.
+
+The input transfer time is estimated using two matrix panels of size \(N \times b\), where \(N\) is the matrix dimension and \(b\) is the tile dimension. The output transfer corresponds to a \(b \times b\) tile. Transfer times include fixed overheads.
+
+Worker computation time is estimated from the number of arithmetic operations and an assigned speed factor. The current worker speed factors are `0.92`, `1.00` and `1.07`.
+
+### Worker Assignment Policies
+
+- **Round Robin:** assigns tasks to available workers in cyclic order.
+- **Predicted:** selects the available worker with the smallest estimated completion time. The estimate accounts for computation time and the shared SPI transfer queue.
+- **Least Loaded:** selects the worker using the estimated completion time and accumulated worker busy time.
+
+Tasks are taken from the queue in their existing order. The selected policy determines which available worker receives the next task.
+
+## Numerical Validation
+
+The simulator performs actual floating-point matrix multiplication. Input matrices are initialized deterministically, and a sequential reference result is calculated separately.
+
+After all output tiles have been computed, the resulting matrix is compared with the reference matrix using the relative Frobenius error:
+
+\[
+\varepsilon_F =
+\frac{\|C_{\mathrm{sim}}-C_{\mathrm{ref}}\|_F}
+{\|C_{\mathrm{ref}}\|_F}
+\]
+
+The result is considered valid if:
+
+\[
+\varepsilon_F \leq 10^{-6}
+\]
+
+Numerical validation is reported separately from the event indicating completion of result transfer.
+
+## Monitoring and Experiment Results
+
+The web interface provides:
+
+- Experiment configuration and execution controls.
+- Current job state and execution progress.
+- Worker states, speed factors and completed tile counts.
+- Task assignment and event history.
+- Simulation time and worker utilization.
+- Numerical validation results.
+- Experiment history with configuration parameters, execution time, utilization and validation status.
+
+The latest three experiment results are retained in memory. The event log can be exported as a text file.
+
+## Current Limitations
+
+- The application currently uses only the simulation backend. Physical SPI communication and GPIO READY/ACK signals are not implemented.
+- Computation speed factors and SPI transfer overheads are model assumptions, not measurements of the target hardware.
+- READY and ACK are represented as logical simulation events; electrical signal timing is not modeled.
+- Packet framing, CRC, retransmission, sequence numbers and timeout recovery are not implemented.
+- A worker can be disabled only when it is idle. Reassignment of tasks during execution is not supported.
+- Experiment history is stored in memory and is not preserved after application restart.
+- The HTTP server has no authentication or access control and is intended for a trusted development environment only.
