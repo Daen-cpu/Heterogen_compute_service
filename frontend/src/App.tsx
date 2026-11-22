@@ -195,7 +195,6 @@ export default function App() {
                         <span />
                     </div>
                     <div className="brand-copy">
-                        <div className="brand-name">HETERO<span>COMPUTE</span></div>
                         <div className="brand-caption">ПЛАТФОРМА РАСПРЕДЕЛЁННЫХ ВЫЧИСЛЕНИЙ</div>
                     </div>
                 </div>
@@ -663,7 +662,7 @@ export default function App() {
             )}
 
             <footer className="app-footer">
-                <span>HETEROCOMPUTE · ПРОГРАММНАЯ ПЛАТФОРМА</span>
+                <span>ПРОГРАММНАЯ ПЛАТФОРМА</span>
                 <span>Блочные матричные вычисления · v0.4</span>
             </footer>
         </main>
